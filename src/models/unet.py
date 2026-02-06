@@ -87,8 +87,90 @@ class UNet(nn.Module):
         self.dropout = dropout
         self.use_scale_shift_norm = use_scale_shift_norm
         
-        # TODO: build your own unet architecture here
-        # Pro tips: remember to take care of the time embeddings!
+        self.num_levels = len(channel_mult)
+        self.attention_resolutions = set(attention_resolutions)
+
+        time_embed_dim = base_channels * 4
+        self.time_embed = TimestepEmbedding(time_embed_dim)
+
+        # Input convolution
+        self.conv_in = nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1)
+
+        # Downsampling path
+        self.down_blocks = nn.ModuleList()
+        self.down_attn = nn.ModuleList()
+        self.downsamples = nn.ModuleList()
+
+        curr_ch = base_channels
+        skip_channels: List[int] = [curr_ch]
+        for level, mult in enumerate(channel_mult):
+            out_ch = base_channels * mult
+            for _ in range(num_res_blocks):
+                self.down_blocks.append(
+                    ResBlock(
+                        curr_ch,
+                        out_ch,
+                        time_embed_dim,
+                        dropout=dropout,
+                        use_scale_shift_norm=use_scale_shift_norm,
+                    )
+                )
+                self.down_attn.append(AttentionBlock(out_ch, num_heads=num_heads))
+                curr_ch = out_ch
+                skip_channels.append(curr_ch)
+
+            if level != self.num_levels - 1:
+                self.downsamples.append(Downsample(curr_ch))
+                skip_channels.append(curr_ch)
+            else:
+                self.downsamples.append(nn.Identity())
+
+        # Middle blocks
+        self.mid_block1 = ResBlock(
+            curr_ch,
+            curr_ch,
+            time_embed_dim,
+            dropout=dropout,
+            use_scale_shift_norm=use_scale_shift_norm,
+        )
+        self.mid_attn = AttentionBlock(curr_ch, num_heads=num_heads)
+        self.mid_block2 = ResBlock(
+            curr_ch,
+            curr_ch,
+            time_embed_dim,
+            dropout=dropout,
+            use_scale_shift_norm=use_scale_shift_norm,
+        )
+
+        # Upsampling path
+        self.up_blocks = nn.ModuleList()
+        self.up_attn = nn.ModuleList()
+        self.upsamples = nn.ModuleList()
+
+        for level, mult in reversed(list(enumerate(channel_mult))):
+            out_ch = base_channels * mult
+            for _ in range(num_res_blocks + 1):
+                skip_ch = skip_channels.pop()
+                self.up_blocks.append(
+                    ResBlock(
+                        curr_ch + skip_ch,
+                        out_ch,
+                        time_embed_dim,
+                        dropout=dropout,
+                        use_scale_shift_norm=use_scale_shift_norm,
+                    )
+                )
+                self.up_attn.append(AttentionBlock(out_ch, num_heads=num_heads))
+                curr_ch = out_ch
+
+            if level != 0:
+                self.upsamples.append(Upsample(curr_ch))
+            else:
+                self.upsamples.append(nn.Identity())
+
+        # Output layers
+        self.out_norm = GroupNorm32(32, curr_ch)
+        self.out_conv = nn.Conv2d(curr_ch, out_channels, kernel_size=3, padding=1)
     
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """
@@ -103,7 +185,51 @@ class UNet(nn.Module):
             Output tensor of shape (batch_size, out_channels, height, width)
         """
 
-        raise NotImplementedError
+        time_emb = self.time_embed(t)
+
+        h = self.conv_in(x)
+        hs: List[torch.Tensor] = [h]
+
+        # Downsampling
+        down_idx = 0
+        for level in range(self.num_levels):
+            for _ in range(self.num_res_blocks):
+                h = self.down_blocks[down_idx](h, time_emb)
+                if h.shape[-1] in self.attention_resolutions:
+                    h = self.down_attn[down_idx](h)
+                hs.append(h)
+                down_idx += 1
+
+            if level != self.num_levels - 1:
+                h = self.downsamples[level](h)
+                hs.append(h)
+
+        # Middle
+        h = self.mid_block1(h, time_emb)
+        if h.shape[-1] in self.attention_resolutions:
+            h = self.mid_attn(h)
+        h = self.mid_block2(h, time_emb)
+
+        # Upsampling
+        up_idx = 0
+        upsample_idx = 0
+        for level in reversed(range(self.num_levels)):
+            for _ in range(self.num_res_blocks + 1):
+                skip = hs.pop()
+                h = torch.cat([h, skip], dim=1)
+                h = self.up_blocks[up_idx](h, time_emb)
+                if h.shape[-1] in self.attention_resolutions:
+                    h = self.up_attn[up_idx](h)
+                up_idx += 1
+
+            if level != 0:
+                h = self.upsamples[upsample_idx](h)
+            upsample_idx += 1
+
+        h = self.out_norm(h)
+        h = F.silu(h)
+        h = self.out_conv(h)
+        return h
 
 
 def create_model_from_config(config: dict) -> UNet:

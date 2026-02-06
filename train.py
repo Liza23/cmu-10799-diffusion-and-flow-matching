@@ -42,7 +42,7 @@ from tqdm import tqdm
 
 from src.models import UNet, create_model_from_config
 from src.data import create_dataloader_from_config, save_image, unnormalize
-from src.methods import DDPM
+from src.methods import DDPM, FlowMatching
 from src.utils import EMA
 
 import wandb
@@ -238,7 +238,22 @@ def generate_samples(
         ema.apply_shadow()
 
     samples = None
-    # TODO: sample with your method.sample()
+    num_steps = config.get('sampling', {}).get('num_steps', None)
+    sampling_config = config.get('sampling', {})
+    sampler = sampling_config.get('sampler', 'ddpm')
+    eta = sampling_config.get('eta', 0.0)
+    if 'sampler' in sampling_kwargs:
+        sampler = sampling_kwargs.pop('sampler')
+    if 'eta' in sampling_kwargs:
+        eta = sampling_kwargs.pop('eta')
+    samples = method.sample(
+        batch_size=num_samples,
+        image_shape=image_shape,
+        num_steps=num_steps,
+        sampler=sampler,
+        eta=eta,
+        **sampling_kwargs,
+    )
 
     if use_ema:
         ema.restore()
@@ -261,7 +276,12 @@ def save_samples(
         num_samples: Number of samples, used to calculate grid layout.
     """
 
-    raise NotImplementedError
+    if samples is None:
+        raise ValueError("samples is None")
+
+    samples = unnormalize(samples).clamp(0.0, 1.0)
+    nrow = max(1, int(math.sqrt(num_samples)))
+    save_image(samples, save_path, nrow=nrow)
 
 
 def train(
@@ -397,8 +417,10 @@ def train(
         print(f"Creating {method_name}...")
     if method_name == 'ddpm':
         method = DDPM.from_config(model, config, device)
+    elif method_name == 'flow_matching':
+        method = FlowMatching.from_config(model, config, device)
     else:
-        raise ValueError(f"Unknown method: {method_name}. Only 'ddpm' is currently supported.")
+        raise ValueError(f"Unknown method: {method_name}.")
 
     # Create optimizer
     optimizer = create_optimizer(model, config) # default to AdamW optimizer
@@ -658,8 +680,8 @@ def train(
 def main():
     parser = argparse.ArgumentParser(description='Train diffusion models')
     parser.add_argument('--method', type=str, required=True,
-                       choices=['ddpm'], # You can add more later
-                       help='Method to train (currently only ddpm is supported)')
+                       choices=['ddpm', 'flow_matching'], # You can add more later
+                       help='Method to train (ddpm or flow_matching)')
     parser.add_argument('--config', type=str, required=True,
                        help='Path to config file (e.g., configs/ddpm.yaml)')
     parser.add_argument('--resume', type=str, default=None,

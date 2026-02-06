@@ -33,7 +33,7 @@ from tqdm import tqdm
 
 from src.models import create_model_from_config
 from src.data import save_image
-from src.methods import DDPM
+from src.methods import DDPM, FlowMatching
 from src.utils import EMA
 
 
@@ -57,6 +57,7 @@ def save_samples(
     samples: torch.Tensor,
     save_path: str,
     num_samples: int,
+    nrow: int | None = None,
 ) -> None:
     """
     TODO: save generated samples as images.
@@ -67,7 +68,16 @@ def save_samples(
         num_samples: Number of samples, used to calculate grid layout.
     """
 
-    raise NotImplementedError
+    if samples is None:
+        raise ValueError("samples is None")
+
+    # Ensure [0, 1] range for saving
+    samples = (samples + 1.0) / 2.0
+    samples = samples.clamp(0.0, 1.0)
+
+    if nrow is None:
+        nrow = max(1, int(num_samples ** 0.5))
+    save_image(samples, save_path, nrow=nrow)
 
 
 def main():
@@ -75,8 +85,8 @@ def main():
     parser.add_argument('--checkpoint', type=str, required=True,
                        help='Path to model checkpoint')
     parser.add_argument('--method', type=str, required=True,
-                       choices=['ddpm'], # You can add more later
-                       help='Method used for training (currently only ddpm is supported)')
+                       choices=['ddpm', 'flow_matching'], # You can add more later
+                       help='Method used for training (ddpm or flow_matching)')
     parser.add_argument('--num_samples', type=int, default=64,
                        help='Number of samples to generate')
     parser.add_argument('--output_dir', type=str, default='samples',
@@ -93,6 +103,11 @@ def main():
     # Sampling arguments
     parser.add_argument('--num_steps', type=int, default=None,
                        help='Number of sampling steps (default: from config)')
+    parser.add_argument('--sampler', type=str, default=None,
+                       choices=['ddpm', 'ddim'],
+                       help='Sampling method (default: from config)')
+    parser.add_argument('--eta', type=float, default=None,
+                       help='DDIM eta (default: from config or 0.0)')
     
     # Other options
     parser.add_argument('--no_ema', action='store_true',
@@ -119,8 +134,10 @@ def main():
     # Create method
     if args.method == 'ddpm':
         method = DDPM.from_config(model, config, device)
+    elif args.method == 'flow_matching':
+        method = FlowMatching.from_config(model, config, device)
     else:
-        raise ValueError(f"Unknown method: {args.method}. Only 'ddpm' is currently supported.")
+        raise ValueError(f"Unknown method: {args.method}.")
     
     # Apply EMA weights
     if not args.no_ema:
@@ -152,12 +169,15 @@ def main():
             batch_size = min(args.batch_size, remaining)
 
             num_steps = args.num_steps or config['sampling']['num_steps']
+            sampler = args.sampler or config['sampling'].get('sampler', 'ddpm')
+            eta = args.eta if args.eta is not None else config['sampling'].get('eta', 0.0)
 
             samples = method.sample(
                 batch_size=batch_size,
                 image_shape=image_shape,
                 num_steps=num_steps,
-                # TODO: add your arugments here
+                sampler=sampler,
+                eta=eta,
             )
 
             # Save individual images immediately or collect for grid
@@ -166,7 +186,7 @@ def main():
             else:
                 for i in range(samples.shape[0]):
                     img_path = os.path.join(args.output_dir, f"{sample_idx:06d}.png")
-                    save_samples(samples, img_path, 1)
+                    save_samples(samples[i:i+1], img_path, 1)
                     sample_idx += 1
 
             remaining -= batch_size
@@ -183,7 +203,7 @@ def main():
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             args.output = f"samples_{timestamp}.png"
 
-        save_samples(all_samples, args.output, nrow=8)
+        save_samples(all_samples, args.output, num_samples=args.num_samples, nrow=8)
         print(f"Saved grid to {args.output}")
     else:
         print(f"Saved {args.num_samples} individual images to {args.output_dir}")
