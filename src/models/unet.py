@@ -22,6 +22,7 @@ from typing import List, Optional, Tuple
 
 from .blocks import (
     TimestepEmbedding,
+    ConditionEmbedding,
     ResBlock,
     AttentionBlock,
     Downsample,
@@ -74,6 +75,8 @@ class UNet(nn.Module):
         num_heads: int = 4,
         dropout: float = 0.1,
         use_scale_shift_norm: bool = True,
+        num_attributes: Optional[int] = None,
+        use_conditioning: bool = False,
     ):
         super().__init__()
         
@@ -86,12 +89,18 @@ class UNet(nn.Module):
         self.num_heads = num_heads
         self.dropout = dropout
         self.use_scale_shift_norm = use_scale_shift_norm
+        self.use_conditioning = use_conditioning
+        self.num_attributes = num_attributes or 0
         
         self.num_levels = len(channel_mult)
         self.attention_resolutions = set(attention_resolutions)
 
         time_embed_dim = base_channels * 4
         self.time_embed = TimestepEmbedding(time_embed_dim)
+        if use_conditioning and num_attributes and num_attributes > 0:
+            self.cond_embed = ConditionEmbedding(num_attributes, time_embed_dim)
+        else:
+            self.cond_embed = None
 
         # Input convolution
         self.conv_in = nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1)
@@ -172,20 +181,30 @@ class UNet(nn.Module):
         self.out_norm = GroupNorm32(32, curr_ch)
         self.out_conv = nn.Conv2d(curr_ch, out_channels, kernel_size=3, padding=1)
     
-    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        cond: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
-        TODO: Implement the forward pass of the unet
-        
+        Forward pass.
+
         Args:
-            x: Input tensor of shape (batch_size, in_channels, height, width)
-               This is typically the noisy image x_t
-            t: Timestep tensor of shape (batch_size,)
+            x: Input tensor (batch_size, in_channels, height, width), typically noisy image x_t
+            t: Timestep tensor (batch_size,)
+            cond: Optional condition tensor (batch_size, num_attributes) for classifier-free guidance.
+                  If None and use_conditioning, unconditional (zeros) is used.
 
         Returns:
-            Output tensor of shape (batch_size, out_channels, height, width)
+            Output tensor (batch_size, out_channels, height, width)
         """
-
         time_emb = self.time_embed(t)
+        if self.cond_embed is not None:
+            if cond is None:
+                cond = x.new_zeros(x.shape[0], self.num_attributes)
+            cond_emb = self.cond_embed(cond)
+            time_emb = time_emb + cond_emb
 
         h = self.conv_in(x)
         hs: List[torch.Tensor] = [h]
@@ -245,6 +264,10 @@ def create_model_from_config(config: dict) -> UNet:
     """
     model_config = config['model']
     data_config = config['data']
+    use_conditioning = model_config.get('use_conditioning', False)
+    num_attributes = model_config.get('num_attributes')
+    if use_conditioning and num_attributes is None:
+        num_attributes = data_config.get('num_attributes', 40)
     
     return UNet(
         in_channels=data_config['channels'],
@@ -256,6 +279,8 @@ def create_model_from_config(config: dict) -> UNet:
         num_heads=model_config['num_heads'],
         dropout=model_config['dropout'],
         use_scale_shift_norm=model_config['use_scale_shift_norm'],
+        num_attributes=num_attributes,
+        use_conditioning=use_conditioning,
     )
 
 

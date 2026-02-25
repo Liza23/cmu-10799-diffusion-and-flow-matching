@@ -367,7 +367,8 @@ def train(
     # Create data loader
     if is_main_process:
         print("Creating data loader...")
-    dataloader = create_dataloader_from_config(config, split='train')
+    data_split = data_config.get('split', 'train')
+    dataloader = create_dataloader_from_config(config, split=data_split)
     sampler = None
     if is_distributed:
         sampler = DistributedSampler(
@@ -389,6 +390,14 @@ def train(
     if is_main_process:
         print(f"Dataset size: {len(dataloader.dataset)}")
         print(f"Batches per epoch: {len(dataloader)}")
+
+    # Set num_attributes and attribute_names in config from dataset when using attribute conditioning
+    use_attributes = data_config.get('use_attributes', False)
+    if use_attributes and hasattr(dataloader.dataset, 'num_attributes'):
+        config.setdefault('data', {})['num_attributes'] = dataloader.dataset.num_attributes
+        config.setdefault('data', {})['attribute_names'] = list(dataloader.dataset.attribute_names)
+        if is_main_process:
+            print(f"Attribute conditioning: num_attributes={dataloader.dataset.num_attributes}")
 
     # Create model
     if is_main_process:
@@ -489,31 +498,28 @@ def train(
 
     # Pro tips: before big training runs, it's usually a good idea to sanity check 
     # by overfitting to a single batch with a small number of training iterations
-    # For single batch overfitting, grab one batch and reuse it
     single_batch = None
-    single_batch_base = None  # Store the original small batch
+    single_batch_cond = None  # optional (batch_attrs,) when use_attributes
+    cond_drop_prob = training_config.get('cond_drop_prob', 0.0)
     if overfit_single_batch:
         single_batch_base = next(data_iter)
         if isinstance(single_batch_base, (tuple, list)):
-            single_batch_base = single_batch_base[0]  # Handle (image, label) tuples
-        single_batch_base = single_batch_base.to(device)
-
-        # Replicate to match desired batch size
-        base_batch_size = single_batch_base.shape[0]
-        desired_batch_size = training_config['batch_size']
-
-        if desired_batch_size > base_batch_size:
-            # Replicate the batch to reach desired size
-            num_repeats = (desired_batch_size + base_batch_size - 1) // base_batch_size
-            single_batch = single_batch_base.repeat(num_repeats, 1, 1, 1)[:desired_batch_size]
-            if is_main_process:
-                print(f"Cached single batch: {base_batch_size} samples replicated to {desired_batch_size}")
-                print(f"  Base batch shape: {single_batch_base.shape}")
-                print(f"  Training batch shape: {single_batch.shape}")
+            batch_images = single_batch_base[0].to(device)
+            batch_cond = single_batch_base[1].to(device) if len(single_batch_base) > 1 else None
         else:
-            single_batch = single_batch_base
-            if is_main_process:
-                print(f"Cached single batch with shape: {single_batch.shape}")
+            batch_images = single_batch_base.to(device)
+            batch_cond = None
+        desired_batch_size = training_config['batch_size']
+        base_batch_size = batch_images.shape[0]
+        if desired_batch_size > base_batch_size:
+            num_repeats = (desired_batch_size + base_batch_size - 1) // base_batch_size
+            single_batch = batch_images.repeat(num_repeats, 1, 1, 1)[:desired_batch_size]
+            single_batch_cond = batch_cond.repeat(num_repeats, 1)[:desired_batch_size] if batch_cond is not None else None
+        else:
+            single_batch = batch_images
+            single_batch_cond = batch_cond
+        if is_main_process:
+            print(f"Cached single batch: shape {single_batch.shape}" + (f", cond {single_batch_cond.shape}" if single_batch_cond is not None else ""))
 
     metrics_sum = {}
     metrics_count = 0
@@ -529,6 +535,7 @@ def train(
         # Get batch (cycle through dataset or use single batch)
         if overfit_single_batch:
             batch = single_batch
+            batch_cond = single_batch_cond
         else:
             try:
                 batch = next(data_iter)
@@ -540,22 +547,41 @@ def train(
                 batch = next(data_iter)
 
             if isinstance(batch, (tuple, list)):
-                batch = batch[0]  # Handle (image, label) tuples
-
-            batch = batch.to(device)
+                batch, batch_cond = batch[0].to(device), (batch[1].to(device) if len(batch) > 1 else None)
+            else:
+                batch, batch_cond = batch.to(device), None
         
         # Forward pass with mixed precision
         optimizer.zero_grad()
         
         with autocast(device_type, enabled=config['infrastructure']['mixed_precision']):
-            loss, metrics = method.compute_loss(batch)
+            loss, metrics = method.compute_loss(batch, cond=batch_cond, cond_drop_prob=cond_drop_prob)
+        
+        # Skip step if loss is NaN/Inf (prevents training collapse)
+        if not torch.isfinite(loss):
+            if is_main_process:
+                print(f"Warning: NaN/Inf loss at step {step + 1}, skipping batch")
+            continue
         
         # Backward pass
         scaler.scale(loss).backward()
         
+        # Unscale to check for NaN/Inf gradients (and for clipping)
+        scaler.unscale_(optimizer)
+        has_bad_grad = False
+        for p in model.parameters():
+            if p.grad is not None and not torch.isfinite(p.grad).all():
+                has_bad_grad = True
+                break
+        if has_bad_grad:
+            if is_main_process:
+                print(f"Warning: NaN/Inf gradients at step {step + 1}, skipping optimizer step")
+            optimizer.zero_grad(set_to_none=True)
+            scaler.update()
+            continue
+        
         # Gradient clipping
         if gradient_clip_norm > 0:
-            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
         
         # Optimizer step
@@ -585,10 +611,10 @@ def train(
 
             # Update progress bar
             if is_main_process:
-                pbar.set_postfix({
-                    'loss': f"{avg_metrics['loss']:.4f}",
-                    'steps/s': f"{steps_per_sec:.2f}",
-                })
+                postfix = {'loss': f"{avg_metrics['loss']:.4f}", 'steps/s': f"{steps_per_sec:.2f}"}
+                if 'loss_attr' in avg_metrics:
+                    postfix['loss_attr'] = f"{avg_metrics['loss_attr']:.4f}"
+                pbar.set_postfix(postfix)
 
             # Log to wandb
             if is_main_process and wandb_run is not None:
@@ -616,6 +642,7 @@ def train(
         if (step + 1) % sample_every == 0:
             if is_main_process:
                 print(f"\nGenerating samples at step {step + 1}...")
+                sampling_cfg = config.get('sampling', {})
                 samples = generate_samples(
                     method,
                     num_samples,
@@ -625,6 +652,8 @@ def train(
                     config,
                     ema,
                     current_step=step + 1,
+                    cond=None,
+                    guidance_scale=sampling_cfg.get('guidance_scale', 1.0),
                 )
                 sample_path = os.path.join(log_dir, 'samples', f'samples_{step + 1:07d}.png')
                 save_samples(samples, sample_path, num_samples)

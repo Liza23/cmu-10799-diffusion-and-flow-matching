@@ -10,6 +10,8 @@ suitable for diffusion models and flow matching:
 """
 
 import math
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -60,6 +62,35 @@ class TimestepEmbedding(nn.Module):
         emb = self.sinusoidal(t)
         emb = self.mlp(emb)
         return emb
+
+
+# =============================================================================
+# Condition (Attribute) Embedding for classifier-free guidance
+# =============================================================================
+
+class ConditionEmbedding(nn.Module):
+    """
+    Embed attribute/condition vector into the same dimension as time embedding.
+    Used for classifier-free conditional generation: combine with time_emb in UNet.
+    """
+
+    def __init__(self, num_attributes: int, time_embed_dim: int, hidden_dim: Optional[int] = None):
+        super().__init__()
+        hidden_dim = hidden_dim or time_embed_dim * 2
+        self.mlp = nn.Sequential(
+            nn.Linear(num_attributes, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, time_embed_dim),
+        )
+
+    def forward(self, cond: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            cond: (batch_size, num_attributes) float in [0, 1] or {-1, 1}
+        Returns:
+            (batch_size, time_embed_dim)
+        """
+        return self.mlp(cond)
 
 
 # =============================================================================

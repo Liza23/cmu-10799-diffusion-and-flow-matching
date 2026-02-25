@@ -61,3 +61,8 @@ temp/
 
 # AI files
 .claude/
+
+## manually added gitignore files
+logs/
+docs/
+*.png

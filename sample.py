@@ -17,6 +17,10 @@ Usage:
     # Save individual images to custom directory
     python sample.py --checkpoint checkpoints/ddpm_final.pt --method ddpm --output_dir my_samples
 
+    # Conditional generation (requires a checkpoint trained with use_conditioning=True)
+    python sample.py --checkpoint path/to/conditional_ddpm_final.pt --method ddpm --attributes "Eyeglasses,Brown_Hair,Male" --guidance_scale 2.0 --num_samples 16 --grid
+    python sample.py --checkpoint path/to/conditional_ddpm_final.pt --method ddpm --list_attributes   # print valid attribute names
+
 What you need to implement:
 - Incorporate your sampling scheme to this pipeline
 - Save generated samples as images for logging
@@ -32,9 +36,33 @@ import torch
 from tqdm import tqdm
 
 from src.models import create_model_from_config
-from src.data import save_image
+from src.data import save_image, CELEBA_40_ATTRIBUTES
 from src.methods import DDPM, FlowMatching
 from src.utils import EMA
+
+
+def build_condition_from_names(
+    attribute_names_to_set: list,
+    num_attributes: int,
+    batch_size: int,
+    device: torch.device,
+    attr_order=None,
+) -> torch.Tensor:
+    """
+    Build condition tensor (batch_size, num_attributes) from attribute names to set to 1.
+    attr_order: list of attribute names in the ORDER the model was trained with (from checkpoint config).
+                If None, uses CELEBA_40_ATTRIBUTES. Must match training order or conditioning is wrong.
+    """
+    order = attr_order if attr_order is not None else CELEBA_40_ATTRIBUTES
+    attr_to_idx = {name: i for i, name in enumerate(order)}
+    cond = torch.zeros(batch_size, num_attributes, device=device, dtype=torch.float32)
+    for name in attribute_names_to_set:
+        name = name.strip()
+        if name in attr_to_idx and attr_to_idx[name] < num_attributes:
+            cond[:, attr_to_idx[name]] = 1.0
+        elif name:
+            print(f"Warning: unknown attribute '{name}' (ignored). Use e.g. --list_attributes to see valid names.")
+    return cond
 
 
 def load_checkpoint(checkpoint_path: str, device: torch.device):
@@ -109,6 +137,14 @@ def main():
     parser.add_argument('--eta', type=float, default=None,
                        help='DDIM eta (default: from config or 0.0)')
     
+    # Conditional generation (only for models trained with use_conditioning=True)
+    parser.add_argument('--attributes', type=str, default=None,
+                       help='Comma-separated attribute names to generate with (e.g. Eyeglasses,Brown_Hair,Male). Requires a conditional checkpoint.')
+    parser.add_argument('--guidance_scale', type=float, default=None,
+                       help='Classifier-free guidance scale (default: from config, often 1.0–5.0 for stronger attributes)')
+    parser.add_argument('--list_attributes', action='store_true',
+                       help='Print the 40 CelebA attribute names and exit (use these with --attributes)')
+    
     # Other options
     parser.add_argument('--no_ema', action='store_true',
                        help='Use training weights instead of EMA weights')
@@ -116,6 +152,15 @@ def main():
                        help='Device to use')
     
     args = parser.parse_args()
+    
+    if args.list_attributes:
+        ckpt = torch.load(args.checkpoint, map_location="cpu")
+        cfg = ckpt.get("config", {})
+        order = cfg.get("data", {}).get("attribute_names") or CELEBA_40_ATTRIBUTES
+        print("Attribute names and index (use these with --attributes; order must match checkpoint):")
+        for i, name in enumerate(order):
+            print(f"  {i:2d}: {name}")
+        return
     
     # Setup device
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
@@ -152,6 +197,24 @@ def main():
     data_config = config['data']
     image_shape = (data_config['channels'], data_config['image_size'], data_config['image_size'])
     
+    # Condition for conditional generation (use checkpoint's attribute order so indices match training)
+    use_conditioning = config.get('model', {}).get('use_conditioning', False)
+    num_attributes = config.get('model', {}).get('num_attributes') or config.get('data', {}).get('num_attributes', 40)
+    attr_order = config.get('data', {}).get('attribute_names')  # order the model was trained with
+    if attr_order is None:
+        attr_order = CELEBA_40_ATTRIBUTES
+    guidance_scale = args.guidance_scale if args.guidance_scale is not None else config.get('sampling', {}).get('guidance_scale', 1.0)
+    attr_names_parsed = [a.strip() for a in args.attributes.split(',') if a.strip()] if args.attributes else []
+    if args.attributes and not use_conditioning:
+        print("WARNING: This checkpoint was trained WITHOUT attribute conditioning (use_conditioning=False).")
+        print("         Your --attributes are being IGNORED; output is unconditional.")
+        print("         To get attribute conditioning: train with data.use_attributes=true and model.use_conditioning=true, then sample from that checkpoint.")
+        attr_names_parsed = []
+    elif use_conditioning and attr_names_parsed:
+        print(f"Conditional generation with attributes: {attr_names_parsed}, guidance_scale={guidance_scale}")
+    elif use_conditioning and not attr_names_parsed:
+        print("Conditional checkpoint but no --attributes given; sampling unconditionally (zeros).")
+    
     # Generate samples
     print(f"Generating {args.num_samples} samples...")
 
@@ -172,12 +235,22 @@ def main():
             sampler = args.sampler or config['sampling'].get('sampler', 'ddpm')
             eta = args.eta if args.eta is not None else config['sampling'].get('eta', 0.0)
 
+            # Build condition for this batch (same cond repeated for each sample when using --attributes)
+            if use_conditioning and attr_names_parsed:
+                cond = build_condition_from_names(
+                    attr_names_parsed, num_attributes, batch_size, device, attr_order=attr_order
+                )
+            else:
+                cond = None
+
             samples = method.sample(
                 batch_size=batch_size,
                 image_shape=image_shape,
                 num_steps=num_steps,
                 sampler=sampler,
                 eta=eta,
+                cond=cond,
+                guidance_scale=guidance_scale,
             )
 
             # Save individual images immediately or collect for grid

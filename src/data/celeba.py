@@ -12,7 +12,8 @@ What you need to implement:
 """
 
 import os
-from typing import Optional, Tuple, Callable
+from pathlib import Path
+from typing import Optional, Tuple, Callable, List, Union
 
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -21,6 +22,17 @@ from torchvision.transforms import functional as TF
 from torchvision.utils import make_grid as torch_make_grid
 from torchvision.utils import save_image as torch_save_image
 from PIL import Image
+
+# Default CelebA 40 attribute names (standard order). Used when dataset has no attributes.
+CELEBA_40_ATTRIBUTES = [
+    "5_o_Clock_Shadow", "Arched_Eyebrows", "Attractive", "Bags_Under_Eyes", "Bald",
+    "Bangs", "Big_Lips", "Big_Nose", "Black_Hair", "Blond_Hair", "Blurry", "Brown_Hair",
+    "Bushy_Eyebrows", "Chubby", "Double_Chin", "Eyeglasses", "Goatee", "Gray_Hair",
+    "Heavy_Makeup", "High_Cheekbones", "Male", "Mouth_Slightly_Open", "Mustache",
+    "Narrow_Eyes", "No_Beard", "Oval_Face", "Pale_Skin", "Pointy_Nose", "Receding_Hairline",
+    "Rosy_Cheeks", "Sideburns", "Smiling", "Straight_Hair", "Wavy_Hair", "Wearing_Earrings",
+    "Wearing_Hat", "Wearing_Lipstick", "Wearing_Necklace", "Wearing_Necktie", "Young",
+]
 
 
 class CelebADataset(Dataset):
@@ -48,6 +60,8 @@ class CelebADataset(Dataset):
         augment: bool = True,
         from_hub: bool = False,
         repo_name: str = "electronickale/cmu-10799-celeba64-subset",
+        use_attributes: bool = False,
+        attribute_names: Optional[List[str]] = None,
     ):
         self.root = root
         self.split = split
@@ -55,6 +69,10 @@ class CelebADataset(Dataset):
         self.augment = augment
         self.from_hub = from_hub
         self.repo_name = repo_name
+        self.use_attributes = use_attributes
+        self.attribute_names: List[str] = []
+        self.num_attributes: int = 0
+        self._attrs_df = None  # for local folder mode: pandas DataFrame keyed by image_id
 
         # Build transforms
         self.transform = self._build_transforms() # TODO write your own image transform function
@@ -64,6 +82,17 @@ class CelebADataset(Dataset):
             self._load_from_hub()
         else:
             self._load_from_local()
+
+        # Set attribute names and count (for conditional generation)
+        if use_attributes:
+            if attribute_names is not None:
+                self.attribute_names = list(attribute_names)
+            else:
+                self._infer_attribute_names()
+            self.num_attributes = len(self.attribute_names)
+            if self.num_attributes == 0:
+                self.attribute_names = CELEBA_40_ATTRIBUTES
+                self.num_attributes = len(self.attribute_names)
 
     def _load_from_hub(self):
         """Load dataset from HuggingFace Hub or cached Arrow format."""
@@ -101,6 +130,7 @@ class CelebADataset(Dataset):
                 self.data = list(dataset[hf_split])
 
             print(f"✓ Loaded {len(self.data)} images from cached '{hf_split}' split")
+            self._loaded_from_arrow = True
             return
 
         # Otherwise, download from HuggingFace Hub
@@ -129,6 +159,7 @@ class CelebADataset(Dataset):
             self.dataset = load_dataset(self.repo_name, split=hf_split, cache_dir=cache_dir)
             self.data = list(self.dataset)
 
+        self._loaded_from_arrow = True
         print(f"Loaded {len(self.data)} images from {hf_split} split")
 
     def _load_from_local(self):
@@ -160,6 +191,10 @@ class CelebADataset(Dataset):
         else:
             split_path = Path(self.root) / split_dir
             self.data = self._load_split_data(split_path)
+
+        # Load attributes CSV for folder mode if present (for use_attributes)
+        if self.use_attributes and not getattr(self, "_loaded_from_arrow", False):
+            self._load_attributes_csv()
 
         print(f"Loaded {len(self.data)} images from local directory")
 
@@ -202,7 +237,39 @@ class CelebADataset(Dataset):
             self.data = list(dataset[hf_split])
 
         print(f"Loaded {len(self.data)} images from {hf_split} split")
+        self._loaded_from_arrow = True
         return True
+
+    def _load_attributes_csv(self) -> None:
+        """Load attributes from split's attributes.csv if it exists. Sets self._attrs_df."""
+        split_dir = "validation" if self.split == "valid" else self.split
+        if self.split == "all":
+            # Prefer train CSV for attribute names; merge if both exist
+            train_path = Path(self.root) / "train" / "attributes.csv"
+            if train_path.exists():
+                import pandas as pd
+                self._attrs_df = pd.read_csv(train_path, index_col="image_id")
+                return
+            split_dir = "train"
+        csv_path = Path(self.root) / split_dir / "attributes.csv"
+        if csv_path.exists():
+            import pandas as pd
+            self._attrs_df = pd.read_csv(csv_path, index_col="image_id")
+
+    def _infer_attribute_names(self) -> None:
+        """Set self.attribute_names from data (Hub/Arrow first item keys or _attrs_df columns)."""
+        if self._attrs_df is not None:
+            self.attribute_names = [c for c in self._attrs_df.columns]
+            return
+        if len(self.data) > 0:
+            item = self.data[0]
+            if isinstance(item, dict):
+                names = [k for k in item.keys() if k not in ("image", "image_id")]
+                if names:
+                    self.attribute_names = names
+                    return
+        # No attributes in data; keep default empty so __init__ will use CELEBA_40_ATTRIBUTES
+        return
 
     def _load_split_data(self, split_path):
         """Load data from a split directory."""
@@ -252,35 +319,59 @@ class CelebADataset(Dataset):
     def __len__(self) -> int:
         return len(self.data)
 
-    def __getitem__(self, idx: int) -> torch.Tensor:
+    def _get_attributes_tensor(self, item: Union[dict, object], image_id: str) -> torch.Tensor:
+        """Build attribute vector (B, num_attributes) in {0, 1} for this item."""
+        out = torch.zeros(self.num_attributes, dtype=torch.float32)
+        if self._attrs_df is not None:
+            # Local folder: look up by image_id (index of CSV)
+            try:
+                row = self._attrs_df.loc[image_id]
+                for i, name in enumerate(self.attribute_names):
+                    if name in self._attrs_df.columns:
+                        val = row[name]
+                        out[i] = 1.0 if (val == 1 or val is True or str(val).lower() == "true") else 0.0
+            except KeyError:
+                pass
+            return out
+        if isinstance(item, dict):
+            for i, name in enumerate(self.attribute_names):
+                if name in item:
+                    val = item[name]
+                    out[i] = 1.0 if (val == 1 or val is True or str(val).lower() == "true") else 0.0
+        return out
+
+    def __getitem__(self, idx: int) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Get a single image.
+        Get a single image, and optionally its attribute vector for conditional generation.
 
         Args:
             idx: Index of the image
 
         Returns:
-            Image tensor of shape (3, image_size, image_size) in range [-1, 1]
-
-        Note:
-            We only return the image, not the attributes, since we're doing
-            unconditional generation.
+            If use_attributes is False: image tensor (3, image_size, image_size) in [-1, 1].
+            If use_attributes is True: (image, attributes) with attributes (num_attributes,) float in {0, 1}.
         """
         item = self.data[idx]
 
         # Load image
-        if self.from_hub:
-            # HuggingFace datasets provide PIL images directly
+        if self.from_hub or getattr(self, "_loaded_from_arrow", False):
             image = item["image"]
         else:
-            # Local mode: load from file path
             image = Image.open(item["image"]).convert("RGB")
+
+        image_id = item.get("image_id", "")
+        if not image_id and "image" in item and isinstance(item["image"], str):
+            image_id = Path(item["image"]).name
 
         # Apply transforms
         if self.transform:
             image = self.transform(image)
 
-        return image
+        if not self.use_attributes:
+            return image
+
+        attrs = self._get_attributes_tensor(item, image_id)
+        return image, attrs
 
 
 def create_dataloader(
@@ -295,6 +386,8 @@ def create_dataloader(
     drop_last: bool = True,
     from_hub: bool = False,
     repo_name: str = "electronickale/cmu-10799-celeba64-subset",
+    use_attributes: bool = False,
+    attribute_names: Optional[List[str]] = None,
 ) -> DataLoader:
     """
     Create a DataLoader for CelebA.
@@ -322,6 +415,8 @@ def create_dataloader(
         augment=augment,
         from_hub=from_hub,
         repo_name=repo_name,
+        use_attributes=use_attributes,
+        attribute_names=attribute_names,
     )
 
     if shuffle is None:
@@ -363,6 +458,8 @@ def create_dataloader_from_config(config: dict, split: str = "train") -> DataLoa
         augment=(split == "train" and data_config.get('augment', True)),
         from_hub=data_config.get('from_hub', False),
         repo_name=data_config.get('repo_name', 'electronickale/cmu-10799-celeba64-subset'),
+        use_attributes=data_config.get('use_attributes', False),
+        attribute_names=data_config.get('attribute_names'),
     )
 
 """

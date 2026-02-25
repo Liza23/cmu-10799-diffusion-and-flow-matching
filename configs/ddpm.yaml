@@ -8,6 +8,8 @@ data:
   num_workers: 4
   pin_memory: true
   augment: true
+  split: "all"  # "train" | "validation" | "all". Use "all" for full data (train+val) after split.
+  use_attributes: true
 
 model:
   base_channels: 128
@@ -17,6 +19,9 @@ model:
   num_heads: 4
   dropout: 0.1
   use_scale_shift_norm: true
+  # Classifier-free conditioning
+  use_conditioning: true
+  num_attributes: 40  # used when use_conditioning true (or from data if set by train)
 
 training:
   batch_size: 128
@@ -26,27 +31,32 @@ training:
   ema_decay: 0.9999
   ema_start: 5000
   gradient_clip_norm: 1.0
-  num_iterations: 100000
+  num_iterations: 200000
   log_every: 50
   sample_every: 5000
   save_every: 10000
   num_samples: 64
+  cond_drop_prob: 0.1  # classifier-free: prob of unconditional during training (only if use_conditioning)
 
 ddpm:
   num_timesteps: 1000
   beta_start: 1.0e-4
   beta_end: 0.02
   beta_schedule: "linear"
+  # Option A: Attribute disentanglement regularization
+  attr_loss_weight: 0.1  # 0 = off (baseline). Try 0.1, 0.5, 1.0 for ablations
+  attr_classifier_checkpoint: checkpoints/attr_classifier.pt  # path to trained classifier, e.g. checkpoints/attr_classifier.pt
 
 sampling:
   num_steps: 1000
   sampler: "ddpm"
+  guidance_scale: 1.0  # >1 amplifies attribute effect (classifier-free guidance)
 
 infrastructure:
   seed: 42
   device: "cuda"
   num_gpus: 1
-  mixed_precision: true
+  mixed_precision: false
   compile_model: false
 
 checkpoint:

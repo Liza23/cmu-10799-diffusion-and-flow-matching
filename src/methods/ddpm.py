@@ -1,5 +1,7 @@
 """
 Denoising Diffusion Probabilistic Models (DDPM)
+
+Option A: Attribute disentanglement regularization via L_attr = BCE(g(pred_x0), c).
 """
 
 import math
@@ -21,10 +23,14 @@ class DDPM(BaseMethod):
         beta_start: float,
         beta_end: float,
         beta_schedule: Literal["linear"] = "linear",
+        attr_classifier: Optional[nn.Module] = None,
+        attr_loss_weight: float = 0.0,
     ):
         super().__init__(model, device)
 
         self.num_timesteps = int(num_timesteps)
+        self.attr_classifier = attr_classifier
+        self.attr_loss_weight = attr_loss_weight
         self.beta_start = float(beta_start)
         self.beta_end = float(beta_end)
 
@@ -99,30 +105,71 @@ class DDPM(BaseMethod):
     # Training loss
     # =========================================================================
 
-    def compute_loss(self, x_0: torch.Tensor, **kwargs) -> Tuple[torch.Tensor, Dict[str, float]]:
+    def _apply_cond_drop(self, cond: Optional[torch.Tensor], cond_drop_prob: float) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """With probability cond_drop_prob replace condition with zeros. Returns (cond_dropped, keep_mask) with keep_mask (B,) 1.0 where cond was kept."""
+        if cond is None:
+            return None, None
+        if cond_drop_prob <= 0.0:
+            return cond, torch.ones(cond.shape[0], device=cond.device, dtype=torch.float32)
+        keep = (torch.rand(cond.shape[0], device=cond.device) >= cond_drop_prob).float()
+        mask = keep.unsqueeze(1).expand_as(cond)
+        return cond * mask, keep
+
+    def compute_loss(self, x_0: torch.Tensor, cond: Optional[torch.Tensor] = None, cond_drop_prob: float = 0.0, **kwargs) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
-        TODO: Implement your DDPM loss function here
+        DDPM loss. Optionally conditional with classifier-free dropout.
 
         Args:
-            x_0: Clean data samples of shape (batch_size, channels, height, width)
-            **kwargs: Additional method-specific arguments
-        
-        Returns:
-            loss: Scalar loss tensor for backpropagation
-            metrics: Dictionary of metrics for logging (e.g., {'mse': 0.1})
+            x_0: Clean data (batch_size, channels, height, width)
+            cond: Optional attributes (batch_size, num_attributes). Dropped with cond_drop_prob.
+            cond_drop_prob: Probability of replacing cond with zeros (unconditional).
         """
-
         batch_size = x_0.shape[0]
         t = torch.randint(0, self.num_timesteps, (batch_size,), device=x_0.device, dtype=torch.long)
         x_t, noise = self.forward_process(x_0, t)
 
-        pred_noise = self.model(x_t, t)
+        cond_dropped, keep_mask = self._apply_cond_drop(cond, cond_drop_prob)
+        pred_noise = self.model(x_t, t, cond=cond_dropped)
+        # Prevent NaN/Inf from UNet (e.g. mixed precision overflow) from poisoning loss and downstream
+        pred_noise = torch.clamp(pred_noise, -20.0, 20.0)
+        pred_noise = torch.nan_to_num(pred_noise, nan=0.0, posinf=20.0, neginf=-20.0)
         loss = F.mse_loss(pred_noise, noise)
 
         metrics = {
             "loss": loss.detach(),
             "mse": loss.detach(),
         }
+        # Option A: Attribute consistency loss BCE(g(pred_x0), c) only on samples where cond was kept
+        if (
+            self.attr_classifier is not None
+            and self.attr_loss_weight > 0
+            and cond is not None
+            and keep_mask is not None
+        ):
+            low_t = t < (self.num_timesteps // 2)
+            sqrt_alpha_bar = self._extract(self.sqrt_alpha_bars, t, x_t.shape)
+            sqrt_one_minus = self._extract(self.sqrt_one_minus_alpha_bars, t, x_t.shape)
+            pred_x0 = (x_t - sqrt_one_minus * pred_noise) / sqrt_alpha_bar
+            pred_x0 = torch.clamp(pred_x0, -1.0, 1.0)
+            pred_x0 = torch.nan_to_num(pred_x0, nan=0.0, posinf=1.0, neginf=-1.0)
+            with torch.amp.autocast(device_type=x_t.device.type, enabled=False):
+                pred_x0_f32 = pred_x0.float()
+                logits = self.attr_classifier(pred_x0_f32)
+            logits = torch.clamp(logits, -10.0, 10.0)
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=10.0, neginf=-10.0)
+            loss_attr_per = F.binary_cross_entropy_with_logits(logits, cond, reduction="none").mean(dim=1)
+            loss_attr_per = torch.nan_to_num(loss_attr_per, nan=0.0, posinf=2.0, neginf=0.0)
+            mask = keep_mask * (low_t.float().to(keep_mask.device))
+            n = mask.sum().clamp(min=1.0)
+            loss_attr = (loss_attr_per * mask).sum() / n
+            loss_attr = torch.nan_to_num(loss_attr, nan=0.0, posinf=2.0, neginf=0.0)
+            loss_attr = torch.clamp(loss_attr, 0.0, 2.0)
+            loss = loss + self.attr_loss_weight * loss_attr
+            metrics["loss_attr"] = loss_attr.detach()
+
+        # Final guard: never return non-finite loss (fallback to MSE only so backward still works)
+        if not torch.isfinite(loss):
+            loss = F.mse_loss(pred_noise, noise)
         return loss, metrics
 
     # =========================================================================
@@ -130,19 +177,22 @@ class DDPM(BaseMethod):
     # =========================================================================
     
     @torch.no_grad()
-    def reverse_process(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def reverse_process(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        cond: Optional[torch.Tensor] = None,
+        guidance_scale: float = 1.0,
+    ) -> torch.Tensor:
         """
-        TODO: Implement one step of the DDPM reverse process
-
-        Args:
-            x_t: Noisy samples at time t (batch_size, channels, height, width)
-            t: the time
-            **kwargs: Additional method-specific arguments
-        
-        Returns:
-            x_prev: Noisy samples at time t-1 (batch_size, channels, height, width)
+        One step of the DDPM reverse process. Supports classifier-free guidance.
         """
-        pred_noise = self.model(x_t, t)
+        if guidance_scale <= 1.0 or cond is None:
+            pred_noise = self.model(x_t, t, cond=cond)
+        else:
+            pred_noise_uncond = self.model(x_t, t, cond=None)
+            pred_noise_cond = self.model(x_t, t, cond=cond)
+            pred_noise = pred_noise_uncond + guidance_scale * (pred_noise_cond - pred_noise_uncond)
 
         sqrt_alpha_bar_t = self._extract(self.sqrt_alpha_bars, t, x_t.shape)
         sqrt_one_minus_alpha_bar_t = self._extract(self.sqrt_one_minus_alpha_bars, t, x_t.shape)
@@ -166,11 +216,16 @@ class DDPM(BaseMethod):
         t: torch.Tensor,
         t_prev: torch.Tensor,
         eta: float = 0.0,
+        cond: Optional[torch.Tensor] = None,
+        guidance_scale: float = 1.0,
     ) -> torch.Tensor:
-        """
-        One DDIM step from t -> t_prev.
-        """
-        pred_noise = self.model(x_t, t)
+        """One DDIM step from t -> t_prev. Supports classifier-free guidance."""
+        if guidance_scale <= 1.0 or cond is None:
+            pred_noise = self.model(x_t, t, cond=cond)
+        else:
+            pred_noise_uncond = self.model(x_t, t, cond=None)
+            pred_noise_cond = self.model(x_t, t, cond=cond)
+            pred_noise = pred_noise_uncond + guidance_scale * (pred_noise_cond - pred_noise_uncond)
 
         alpha_bar_t = self._extract(self.alpha_bars, t, x_t.shape)
         alpha_bar_prev = self._extract(self.alpha_bars, t_prev, x_t.shape)
@@ -193,18 +248,12 @@ class DDPM(BaseMethod):
         num_steps: Optional[int] = None,
         sampler: Literal["ddpm", "ddim"] = "ddpm",
         eta: float = 0.0,
+        cond: Optional[torch.Tensor] = None,
+        guidance_scale: float = 1.0,
         **kwargs
     ) -> torch.Tensor:
         """
-        TODO: Implement DDPM sampling loop: start from pure noise, iterate through all the time steps using reverse_process()
-
-        Args:
-            batch_size: Number of samples to generate
-            image_shape: Shape of each image (channels, height, width)
-            **kwargs: Additional method-specific arguments (e.g., num_steps)
-        
-        Returns:
-            samples: Generated samples of shape (batch_size, *image_shape)
+        Sample from the model. Optional cond and classifier-free guidance_scale.
         """
         self.eval_mode()
         num_steps = num_steps or self.num_timesteps
@@ -222,14 +271,14 @@ class DDPM(BaseMethod):
         if sampler == "ddpm":
             for t in timesteps:
                 t_batch = torch.full((batch_size,), t, device=self.device, dtype=torch.long)
-                x_t = self.reverse_process(x_t, t_batch)
+                x_t = self.reverse_process(x_t, t_batch, cond=cond, guidance_scale=guidance_scale)
         elif sampler == "ddim":
             for i in range(len(timesteps)):
                 t = timesteps[i]
                 t_prev = timesteps[i + 1] if i + 1 < len(timesteps) else torch.tensor(0, device=self.device)
                 t_batch = torch.full((batch_size,), t, device=self.device, dtype=torch.long)
                 t_prev_batch = torch.full((batch_size,), t_prev, device=self.device, dtype=torch.long)
-                x_t = self.ddim_step(x_t, t_batch, t_prev_batch, eta=eta)
+                x_t = self.ddim_step(x_t, t_batch, t_prev_batch, eta=eta, cond=cond, guidance_scale=guidance_scale)
         else:
             raise ValueError(f"Unknown sampler: {sampler}")
 
@@ -242,6 +291,8 @@ class DDPM(BaseMethod):
     def to(self, device: torch.device) -> "DDPM":
         nn.Module.to(self, device)
         self.device = device
+        if self.attr_classifier is not None:
+            self.attr_classifier = self.attr_classifier.to(device)
         return self
 
     def state_dict(self) -> Dict:
@@ -253,6 +304,14 @@ class DDPM(BaseMethod):
     @classmethod
     def from_config(cls, model: nn.Module, config: dict, device: torch.device) -> "DDPM":
         ddpm_config = config.get("ddpm", config)
+        attr_classifier = None
+        attr_loss_weight = ddpm_config.get("attr_loss_weight", 0.0)
+        ckpt = ddpm_config.get("attr_classifier_checkpoint")
+        if ckpt and attr_loss_weight > 0:
+            from src.models.attr_classifier import load_attr_classifier
+            num_attrs = config.get("model", {}).get("num_attributes") or config.get("data", {}).get("num_attributes", 40)
+            img_size = config.get("data", {}).get("image_size", 64)
+            attr_classifier = load_attr_classifier(ckpt, device, num_attributes=num_attrs, image_size=img_size)
         instance = cls(
             model=model,
             device=device,
@@ -260,5 +319,7 @@ class DDPM(BaseMethod):
             beta_start=ddpm_config["beta_start"],
             beta_end=ddpm_config["beta_end"],
             beta_schedule=ddpm_config.get("beta_schedule", "linear"),
+            attr_classifier=attr_classifier,
+            attr_loss_weight=attr_loss_weight,
         )
         return instance.to(device)

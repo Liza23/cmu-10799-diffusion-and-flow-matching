@@ -8,6 +8,8 @@ data:
   num_workers: 4
   pin_memory: true
   augment: true
+  use_attributes: false
+  # attribute_names: null
 
 model:
   base_channels: 128
@@ -17,6 +19,8 @@ model:
   num_heads: 4
   dropout: 0.1
   use_scale_shift_norm: true
+  use_conditioning: false
+  num_attributes: 40
 
 training:
   batch_size: 128
@@ -31,6 +35,7 @@ training:
   sample_every: 5000
   save_every: 5000
   num_samples: 64
+  cond_drop_prob: 0.1
 
 flow_matching:
   t_min: 0.0
@@ -39,6 +44,7 @@ flow_matching:
 sampling:
   num_steps: 100
   sampler: "flow_matching"
+  guidance_scale: 1.0
 
 infrastructure:
   seed: 42

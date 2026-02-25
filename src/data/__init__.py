@@ -5,6 +5,7 @@ This module contains dataset loading and preprocessing utilities.
 """
 
 from .celeba import (
+    CELEBA_40_ATTRIBUTES,
     CelebADataset,
     create_dataloader,
     create_dataloader_from_config,
@@ -15,6 +16,7 @@ from .celeba import (
 )
 
 __all__ = [
+    'CELEBA_40_ATTRIBUTES',
     'CelebADataset',
     'create_dataloader',
     'create_dataloader_from_config',
