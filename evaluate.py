@@ -37,6 +37,28 @@ def main():
     ap.add_argument("--batch-size", type=int, default=256, help="Batch size for generation (default: 256)")
     ap.add_argument("--num-steps", type=int, default=None, help="Sampling steps (default: from config)")
     ap.add_argument(
+        "--attributes",
+        type=str,
+        default=None,
+        help="Comma-separated CelebA attributes for conditional generation (passed to sample.py)",
+    )
+    ap.add_argument(
+        "--neg-attributes",
+        "--neg_attributes",
+        dest="neg_attributes",
+        type=str,
+        default=None,
+        help="Comma-separated attributes to set to 0 explicitly (passed to sample.py)",
+    )
+    ap.add_argument(
+        "--guidance-scale",
+        "--guidance",
+        dest="guidance_scale",
+        type=float,
+        default=None,
+        help="Classifier-free guidance scale (passed to sample.py; --guidance is an alias)",
+    )
+    ap.add_argument(
         "--output-dir",
         type=str,
         default=None,
@@ -100,6 +122,11 @@ def main():
 
     if need_gen:
         print(f"Generating {args.num_samples} samples...")
+        if args.guidance_scale is not None and not (args.attributes or args.neg_attributes):
+            print(
+                "Warning: guidance was set without --attributes/--neg-attributes; generation may still be unconditional.",
+                file=sys.stderr,
+            )
         os.makedirs(out_dir, exist_ok=True)
         # Clear existing to avoid mixing old/new
         for f in glob.glob(os.path.join(out_dir, "*.png")) + glob.glob(os.path.join(out_dir, "*.jpg")) + glob.glob(os.path.join(out_dir, "*.jpeg")):
@@ -126,6 +153,12 @@ def main():
             cmd += ["--no_ema"]
         if args.num_steps is not None:
             cmd += ["--num_steps", str(args.num_steps)]
+        if args.attributes:
+            cmd += ["--attributes", args.attributes]
+        if args.neg_attributes:
+            cmd += ["--neg-attributes", args.neg_attributes]
+        if args.guidance_scale is not None:
+            cmd += ["--guidance_scale", str(args.guidance_scale)]
         subprocess.run(cmd, check=True, cwd=project_root)
         print(f"Saved samples to {out_dir}")
 

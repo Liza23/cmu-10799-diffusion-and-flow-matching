@@ -111,7 +111,8 @@ def main():
         # [0,1] for saving
         samples = (samples + 1.0) / 2.0
         samples = samples.clamp(0.0, 1.0)
-        nrow = max(1, int(args.num_samples ** 0.5))
+        # Force 8x2 grid layout when num_samples=16
+        nrow = 8
         path = os.path.join(args.output_dir, f"{label}.png")
         save_image(samples, path, nrow=nrow)
         print(f"  Saved {path}")

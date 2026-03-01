@@ -146,7 +146,7 @@ class DDPM(BaseMethod):
             and cond is not None
             and keep_mask is not None
         ):
-            low_t = t < (self.num_timesteps // 2)
+            low_t = t < (self.num_timesteps // 2) # can change this 
             sqrt_alpha_bar = self._extract(self.sqrt_alpha_bars, t, x_t.shape)
             sqrt_one_minus = self._extract(self.sqrt_one_minus_alpha_bars, t, x_t.shape)
             pred_x0 = (x_t - sqrt_one_minus * pred_noise) / sqrt_alpha_bar

@@ -19,6 +19,7 @@ Usage:
 
     # Conditional generation (requires a checkpoint trained with use_conditioning=True)
     python sample.py --checkpoint path/to/conditional_ddpm_final.pt --method ddpm --attributes "Eyeglasses,Brown_Hair,Male" --guidance_scale 2.0 --num_samples 16 --grid
+    python sample.py --checkpoint path/to/conditional_ddpm_final.pt --method ddpm --attributes "Gray_Hair" --neg-attributes "Male" --guidance_scale 3.0 --num_samples 16 --grid
     python sample.py --checkpoint path/to/conditional_ddpm_final.pt --method ddpm --list_attributes   # print valid attribute names
 
 What you need to implement:
@@ -43,13 +44,18 @@ from src.utils import EMA
 
 def build_condition_from_names(
     attribute_names_to_set: list,
+    attribute_names_to_unset: list,
     num_attributes: int,
     batch_size: int,
     device: torch.device,
     attr_order=None,
 ) -> torch.Tensor:
     """
-    Build condition tensor (batch_size, num_attributes) from attribute names to set to 1.
+    Build condition tensor (batch_size, num_attributes) from:
+    - attribute names to set to 1
+    - attribute names to set to 0
+
+    Unspecified attributes default to 0.
     attr_order: list of attribute names in the ORDER the model was trained with (from checkpoint config).
                 If None, uses CELEBA_40_ATTRIBUTES. Must match training order or conditioning is wrong.
     """
@@ -60,6 +66,12 @@ def build_condition_from_names(
         name = name.strip()
         if name in attr_to_idx and attr_to_idx[name] < num_attributes:
             cond[:, attr_to_idx[name]] = 1.0
+        elif name:
+            print(f"Warning: unknown attribute '{name}' (ignored). Use e.g. --list_attributes to see valid names.")
+    for name in attribute_names_to_unset:
+        name = name.strip()
+        if name in attr_to_idx and attr_to_idx[name] < num_attributes:
+            cond[:, attr_to_idx[name]] = 0.0
         elif name:
             print(f"Warning: unknown attribute '{name}' (ignored). Use e.g. --list_attributes to see valid names.")
     return cond
@@ -140,6 +152,8 @@ def main():
     # Conditional generation (only for models trained with use_conditioning=True)
     parser.add_argument('--attributes', type=str, default=None,
                        help='Comma-separated attribute names to generate with (e.g. Eyeglasses,Brown_Hair,Male). Requires a conditional checkpoint.')
+    parser.add_argument('--neg-attributes', '--neg_attributes', dest='neg_attributes', type=str, default=None,
+                       help='Comma-separated attribute names to set to 0 explicitly (e.g. Male for female-like generation).')
     parser.add_argument('--guidance_scale', type=float, default=None,
                        help='Classifier-free guidance scale (default: from config, often 1.0–5.0 for stronger attributes)')
     parser.add_argument('--list_attributes', action='store_true',
@@ -205,15 +219,24 @@ def main():
         attr_order = CELEBA_40_ATTRIBUTES
     guidance_scale = args.guidance_scale if args.guidance_scale is not None else config.get('sampling', {}).get('guidance_scale', 1.0)
     attr_names_parsed = [a.strip() for a in args.attributes.split(',') if a.strip()] if args.attributes else []
-    if args.attributes and not use_conditioning:
+    neg_attr_names_parsed = [a.strip() for a in args.neg_attributes.split(',') if a.strip()] if args.neg_attributes else []
+    overlap = sorted(set(attr_names_parsed) & set(neg_attr_names_parsed))
+    if overlap:
+        print(f"Error: attributes present in both --attributes and --neg-attributes: {overlap}", file=sys.stderr)
+        sys.exit(2)
+    if (args.attributes or args.neg_attributes) and not use_conditioning:
         print("WARNING: This checkpoint was trained WITHOUT attribute conditioning (use_conditioning=False).")
-        print("         Your --attributes are being IGNORED; output is unconditional.")
+        print("         Your --attributes/--neg-attributes are being IGNORED; output is unconditional.")
         print("         To get attribute conditioning: train with data.use_attributes=true and model.use_conditioning=true, then sample from that checkpoint.")
         attr_names_parsed = []
-    elif use_conditioning and attr_names_parsed:
-        print(f"Conditional generation with attributes: {attr_names_parsed}, guidance_scale={guidance_scale}")
-    elif use_conditioning and not attr_names_parsed:
-        print("Conditional checkpoint but no --attributes given; sampling unconditionally (zeros).")
+        neg_attr_names_parsed = []
+    elif use_conditioning and (attr_names_parsed or neg_attr_names_parsed):
+        print(
+            f"Conditional generation with attributes+={attr_names_parsed}, "
+            f"attributes-={neg_attr_names_parsed}, guidance_scale={guidance_scale}"
+        )
+    elif use_conditioning and not attr_names_parsed and not neg_attr_names_parsed:
+        print("Conditional checkpoint but no --attributes/--neg-attributes given; sampling unconditionally (zeros).")
     
     # Generate samples
     print(f"Generating {args.num_samples} samples...")
@@ -235,10 +258,15 @@ def main():
             sampler = args.sampler or config['sampling'].get('sampler', 'ddpm')
             eta = args.eta if args.eta is not None else config['sampling'].get('eta', 0.0)
 
-            # Build condition for this batch (same cond repeated for each sample when using --attributes)
-            if use_conditioning and attr_names_parsed:
+            # Build condition for this batch (same cond repeated for each sample when using attrs)
+            if use_conditioning and (attr_names_parsed or neg_attr_names_parsed):
                 cond = build_condition_from_names(
-                    attr_names_parsed, num_attributes, batch_size, device, attr_order=attr_order
+                    attr_names_parsed,
+                    neg_attr_names_parsed,
+                    num_attributes,
+                    batch_size,
+                    device,
+                    attr_order=attr_order,
                 )
             else:
                 cond = None
